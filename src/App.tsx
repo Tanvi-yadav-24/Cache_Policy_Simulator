@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Header } from './components/Header';
 import { SimulatorForm } from './components/SimulatorForm';
 import { ResultsTable } from './components/ResultsTable';
@@ -6,6 +6,7 @@ import { Visualization } from './components/Visualization';
 import { StepViewer } from './components/StepViewer';
 import { PoliciesInfo } from './components/PoliciesInfo';
 import { api } from './services/api';
+import { Server, ServerOff } from 'lucide-react';
 import {
   SimulationResult,
   BenchmarkResult,
@@ -21,6 +22,7 @@ function App() {
   const [benchmarkResults, setBenchmarkResults] = useState<BenchmarkResult[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [backendConnected, setBackendConnected] = useState<boolean | null>(null);
 
   const handleSimulate = async (
     policy: string,
@@ -68,7 +70,7 @@ function App() {
     }
   };
 
-  const handleBenchmark = (
+  const handleBenchmark = async (
     cacheSizes: number[],
     numRequests: number,
     keyRange: number,
@@ -78,8 +80,8 @@ function App() {
     setError(null);
     setResults(null);
     try {
-      const benchResults = runBenchmark(cacheSizes, numRequests, keyRange, distribution);
-      setBenchmarkResults(benchResults);
+      const benchData = await api.benchmark(cacheSizes, numRequests, keyRange, distribution);
+      setBenchmarkResults(benchData.results);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Benchmark failed');
     } finally {
@@ -87,15 +89,35 @@ function App() {
     }
   };
 
+  // Check backend connection on mount
+  useEffect(() => {
+    api.isBackendAvailable().then((available) => {
+      setBackendConnected(available);
+    });
+  }, []);
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-100 via-gray-50 to-slate-100">
       <Header />
 
       <main className="max-w-7xl mx-auto px-6 py-8">
-        <div className="bg-green-50 border border-green-200 rounded-lg p-4 mb-6 flex items-start gap-3">
-          <div className="text-green-600 font-medium">Ready:</div>
-          <div className="text-green-800">
-            Simulator is running locally with pure TypeScript implementations. All cache policies (FIFO, LRU, LFU, Random) work without a backend server.
+        <div className={`rounded-lg p-4 mb-6 flex items-start gap-3 ${backendConnected === true ? 'bg-green-50 border border-green-200' : backendConnected === false ? 'bg-amber-50 border border-amber-200' : 'bg-gray-50 border border-gray-200'}`}>
+          {backendConnected === true ? (
+            <Server className="w-5 h-5 text-green-600 mt-0.5 flex-shrink-0" />
+          ) : backendConnected === false ? (
+            <ServerOff className="w-5 h-5 text-amber-600 mt-0.5 flex-shrink-0" />
+          ) : null}
+          <div>
+            <div className={`font-medium ${backendConnected === true ? 'text-green-600' : backendConnected === false ? 'text-amber-600' : 'text-gray-600'}`}>
+              {backendConnected === true ? 'Backend Connected' : backendConnected === false ? 'Local Mode' : 'Checking...'}
+            </div>
+            <div className={`text-sm mt-0.5 ${backendConnected === true ? 'text-green-800' : backendConnected === false ? 'text-amber-800' : 'text-gray-600'}`}>
+              {backendConnected === true
+                ? 'Connected to Go backend. All simulations are persisted to the database.'
+                : backendConnected === false
+                ? 'Running with local TypeScript implementations. Start the Go backend to enable persistence: go run cmd/server/main.go'
+                : 'Checking backend connection...'}
+            </div>
           </div>
         </div>
 

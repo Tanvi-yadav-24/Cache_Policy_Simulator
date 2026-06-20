@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"net/http"
-	"strconv"
+	"os"
+	"time"
 
 	"cache-simulator/internal/cache"
+	"cache-simulator/internal/db"
 	"cache-simulator/internal/generator"
+	"cache-simulator/internal/metrics"
 	"cache-simulator/internal/simulator"
 
 	"github.com/gin-contrib/cors"
@@ -13,26 +17,51 @@ import (
 )
 
 func main() {
+	// Initialize database connection
+	if err := db.Init(); err != nil {
+		// Log but don't fail - backend works without DB in local mode
+		gin.DefaultWriter.Write([]byte("DB init warning: " + err.Error() + "\n"))
+	}
+
 	r := gin.Default()
 
 	// Configure CORS
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"*"},
 		AllowMethods:     []string{"GET", "POST", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Accept"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Client-Info", "Apikey"},
 		AllowCredentials: true,
 	}))
 
 	api := r.Group("/api")
 	{
+		api.GET("/health", healthCheck)
 		api.GET("/policies", getPolicies)
+
 		api.POST("/simulate", runSimulation)
 		api.POST("/generate", generateTrace)
 		api.POST("/compare", runComparison)
 		api.POST("/benchmark", runBenchmark)
+
+		// History endpoints
+		api.GET("/history/simulations", listSimulations)
+		api.GET("/history/comparisons", listComparisons)
+		api.GET("/history/benchmarks", listBenchmarks)
 	}
 
-	r.Run(":8080")
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	r.Run(":" + port)
+}
+
+func healthCheck(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"status":    "ok",
+		"timestamp": time.Now().Unix(),
+		"version":   "1.0.0",
+	})
 }
 
 // PolicyInfo contains information about a cache policy
@@ -53,10 +82,11 @@ func getPolicies(c *gin.Context) {
 
 // SimulationRequest represents a simulation request
 type SimulationRequest struct {
-	Policy      string `json:"policy"`
-	CacheSize   int    `json:"cache_size"`
-	Requests    []int  `json:"requests"`
-	ShowSteps   bool   `json:"show_steps"`
+	Policy       string `json:"policy"`
+	CacheSize    int    `json:"cache_size"`
+	Requests     []int  `json:"requests"`
+	ShowSteps    bool   `json:"show_steps"`
+	Distribution string `json:"distribution,omitempty"`
 }
 
 func runSimulation(c *gin.Context) {
@@ -75,16 +105,33 @@ func runSimulation(c *gin.Context) {
 		result.Steps = nil
 	}
 
+	// Persist to database (async, don't block response)
+	go func() {
+		if db.GetClient() != nil {
+			record := map[string]interface{}{
+				"policy":       req.Policy,
+				"cache_size":   req.CacheSize,
+				"requests":     req.Requests,
+				"steps":        result.Steps,
+				"metrics":      result.Metrics,
+				"distribution": req.Distribution,
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			db.InsertSimulation(ctx, record)
+		}
+	}()
+
 	c.JSON(http.StatusOK, result)
 }
 
 // TraceRequest represents a trace generation request
 type TraceRequest struct {
-	NumRequests int    `json:"num_requests"`
-	KeyRange    int    `json:"key_range"`
+	NumRequests  int    `json:"num_requests"`
+	KeyRange     int    `json:"key_range"`
 	Distribution string `json:"distribution"`
-	Seed        *int64 `json:"seed,omitempty"`
-	WorkingSet  *int   `json:"working_set,omitempty"` // For localized pattern
+	Seed         *int64 `json:"seed,omitempty"`
+	WorkingSet   *int   `json:"working_set,omitempty"` // For localized pattern
 }
 
 func generateTrace(c *gin.Context) {
@@ -112,6 +159,21 @@ func generateTrace(c *gin.Context) {
 		requests = gen.Generate(req.NumRequests, req.KeyRange, distType)
 	}
 
+	// Persist to database (async)
+	go func() {
+		if db.GetClient() != nil {
+			record := map[string]interface{}{
+				"num_requests": req.NumRequests,
+				"key_range":    req.KeyRange,
+				"distribution": req.Distribution,
+				"requests":     requests,
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			db.InsertTrace(ctx, record)
+		}
+	}()
+
 	c.JSON(http.StatusOK, gin.H{
 		"requests": requests,
 		"stats": gin.H{
@@ -124,9 +186,10 @@ func generateTrace(c *gin.Context) {
 
 // ComparisonRequest represents a comparison request
 type ComparisonRequest struct {
-	CacheSize int    `json:"cache_size"`
-	Requests  []int  `json:"requests"`
-	Seeds     []int64 `json:"seeds,omitempty"` // For random policy reproducibility
+	CacheSize    int     `json:"cache_size"`
+	Requests     []int   `json:"requests"`
+	Distribution string  `json:"distribution,omitempty"`
+	Seeds        []int64 `json:"seeds,omitempty"` // For random policy reproducibility
 }
 
 func runComparison(c *gin.Context) {
@@ -137,26 +200,42 @@ func runComparison(c *gin.Context) {
 	}
 
 	results := simulator.RunComparison(req.CacheSize, req.Requests)
+
+	// Persist to database (async)
+	go func() {
+		if db.GetClient() != nil {
+			record := map[string]interface{}{
+				"cache_size":   req.CacheSize,
+				"requests":     req.Requests,
+				"results":      results,
+				"distribution": req.Distribution,
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			db.InsertComparison(ctx, record)
+		}
+	}()
+
 	c.JSON(http.StatusOK, results)
 }
 
 // BenchmarkRequest represents a benchmark request
 type BenchmarkRequest struct {
-	CacheSizes  []int   `json:"cache_sizes"`
-	NumRequests int     `json:"num_requests"`
-	KeyRange    int     `json:"key_range"`
-	Distribution string  `json:"distribution"`
-	Seed        int64   `json:"seed"`
+	CacheSizes   []int  `json:"cache_sizes"`
+	NumRequests  int    `json:"num_requests"`
+	KeyRange     int    `json:"key_range"`
+	Distribution string `json:"distribution"`
+	Seed         int64  `json:"seed"`
 }
 
 // BenchmarkResult represents benchmark results for a single configuration
 type BenchmarkResult struct {
 	Policy     string  `json:"policy"`
-	CacheSize  int      `json:"cache_size"`
+	CacheSize  int     `json:"cache_size"`
 	HitRatio   float64 `json:"hit_ratio"`
-	MissRatio  float64  `json:"miss_ratio"`
-	Evictions  int      `json:"evictions"`
-	ExecTimeNs int64    `json:"exec_time_ns"`
+	MissRatio  float64 `json:"miss_ratio"`
+	Evictions  int     `json:"evictions"`
+	ExecTimeNs int64   `json:"exec_time_ns"`
 }
 
 func runBenchmark(c *gin.Context) {
@@ -204,6 +283,22 @@ func runBenchmark(c *gin.Context) {
 		}
 	}
 
+	// Persist to database (async)
+	go func() {
+		if db.GetClient() != nil {
+			record := map[string]interface{}{
+				"cache_sizes":  req.CacheSizes,
+				"num_requests": req.NumRequests,
+				"key_range":    req.KeyRange,
+				"distribution": req.Distribution,
+				"results":      results,
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			db.InsertBenchmark(ctx, record)
+		}
+	}()
+
 	c.JSON(http.StatusOK, gin.H{
 		"configuration": gin.H{
 			"cache_sizes":  req.CacheSizes,
@@ -214,4 +309,53 @@ func runBenchmark(c *gin.Context) {
 		},
 		"results": results,
 	})
+}
+
+// History endpoints
+func listSimulations(c *gin.Context) {
+	if db.GetClient() == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not configured"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	results, err := db.ListSimulations(ctx, 20)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, results)
+}
+
+func listComparisons(c *gin.Context) {
+	if db.GetClient() == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not configured"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	results, err := db.ListComparisons(ctx, 20)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, results)
+}
+
+func listBenchmarks(c *gin.Context) {
+	if db.GetClient() == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not configured"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	results, err := db.ListBenchmarks(ctx, 20)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, results)
 }
